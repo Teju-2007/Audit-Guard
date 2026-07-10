@@ -234,7 +234,7 @@ if prompt := st.chat_input("Deep dive into specific technical risks..."):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"CONTEXT:\n{full_context}\n\nQUESTION: {prompt}"}
                 ],
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 temperature=0.1
             )
             
