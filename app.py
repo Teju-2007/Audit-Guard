@@ -10,10 +10,12 @@ from sentence_transformers import SentenceTransformer
 
 # 1. INITIAL SETUP
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# Use wide layout to prevent text squeezing
+# Read from .env locally or st.secrets on Streamlit Cloud
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", None)
+
+# Page configuration
 st.set_page_config(page_title="Audit-Guard", page_icon="🛡️", layout="wide")
 
 # --- UI NORMALIZATION (CSS) ---
@@ -25,7 +27,7 @@ st.markdown("""
         line-height: 1.6 !important;
         color: #333;
     }
-    /* Shrink the headers to professional levels */
+    /* Shrink headers */
     h1 { font-size: 26px !important; color: #1E3A8A; margin-bottom: 20px !important; }
     h2 { font-size: 20px !important; border-bottom: 1px solid #ddd; padding-bottom: 8px; margin-top: 25px !important; }
     h3 { font-size: 17px !important; font-weight: bold !important; color: #1E3A8A; }
@@ -62,7 +64,7 @@ def get_audit_scorecard(context_summary, groq_client):
     try:
         resp = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": scoring_system}],
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             response_format={"type": "json_object"}
         )
         return json.loads(resp.choices[0].message.content)
@@ -72,6 +74,9 @@ def get_audit_scorecard(context_summary, groq_client):
 # 2. INITIALIZE MODELS
 @st.cache_resource
 def init_models():
+    if not PINECONE_API_KEY or not GROQ_API_KEY:
+        st.error("Missing API Keys! Ensure GROQ_API_KEY and PINECONE_API_KEY are configured.")
+        st.stop()
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index("audit-guard-index")
@@ -91,45 +96,64 @@ uploaded_file = st.sidebar.file_uploader("Upload Whitepaper", type="pdf")
 if uploaded_file:
     if st.sidebar.button("🚀 Run Full Audit"):
         with st.spinner("Indexing & Scoring..."):
-            # Clean Slate
-            index.delete(delete_all=True)
-            reader = PdfReader(uploaded_file)
-            vectors_to_upsert = []
-            all_text = ""
+            # Safe index clear
+            try:
+                index.delete(delete_all=True)
+            except Exception:
+                pass
 
-            # Single-pass indexing
+            reader = PdfReader(uploaded_file)
+            all_text = ""
+            raw_chunks = []
+
+            # Extract text & chunk metadata
             for page_num, page in enumerate(reader.pages):
                 page_text = page.extract_text() or ""
                 all_text += page_text + " "
                 
                 # Chunking (500 chars with 100 char overlap)
-                chunks = [page_text[i:i+500] for i in range(0, len(page_text), 400)]
-                for chunk in chunks:
+                for i in range(0, len(page_text), 400):
+                    chunk = page_text[i:i+500]
+                    if chunk.strip():
+                        raw_chunks.append({"text": chunk, "page": page_num + 1})
+
+            # Fast Batch Encoding
+            chunk_texts = [c["text"] for c in raw_chunks]
+            if chunk_texts:
+                embeddings = embed_model.encode(chunk_texts, show_progress_bar=False).tolist()
+
+                vectors_to_upsert = []
+                for c_info, emb in zip(raw_chunks, embeddings):
                     vectors_to_upsert.append({
                         "id": str(uuid.uuid4()),
-                        "values": embed_model.encode(chunk).tolist(),
-                        "metadata": {"text": chunk, "page": page_num + 1}
+                        "values": emb,
+                        "metadata": {"text": c_info["text"], "page": c_info["page"]}
                     })
 
-            # Batch Upsert
-            for i in range(0, len(vectors_to_upsert), 100):
-                index.upsert(vectors=vectors_to_upsert[i : i + 100])
+                # Batch Upsert
+                for i in range(0, len(vectors_to_upsert), 100):
+                    index.upsert(vectors=vectors_to_upsert[i : i + 100])
+
+            # Smart Sampling Context
+            if len(all_text) <= 6000:
+                smart_summary_context = all_text
+            else:
+                first_pages = all_text[:2000]
+                middle_pages = all_text[len(all_text)//2 : len(all_text)//2 + 2000]
+                end_pages = all_text[-2000:]
+                smart_summary_context = f"{first_pages}\n{middle_pages}\n{end_pages}"
             
-            # --- SMART SAMPLING FOR SCORECARD ---
-            first_pages = all_text[:2000]
-            middle_pages = all_text[len(all_text)//2 : len(all_text)//2 + 2000]
-            end_pages = all_text[-2000:]
-            smart_summary_context = f"{first_pages}\n{middle_pages}\n{end_pages}"
-            
-            # Generate Scorecard
+            # Save document state to session memory
+            st.session_state.doc_name = uploaded_file.name
             st.session_state.scorecard = get_audit_scorecard(smart_summary_context, groq_client)
-            st.sidebar.success(f"Audit Ready! ({len(vectors_to_upsert)} nodes)")
+            st.sidebar.success(f"Audit Ready! ({len(raw_chunks)} nodes)")
 
 # 4. MAIN UI DISPLAY
 st.title("🛡️ Audit-Guard: Executive Dashboard")
 
 if "scorecard" in st.session_state:
     s = st.session_state.scorecard
+    doc_name = st.session_state.get("doc_name", "Uploaded_Document.pdf")
     
     # Dashboard Metrics
     col1, col2, col3 = st.columns(3)
@@ -146,9 +170,9 @@ if "scorecard" in st.session_state:
         else:
             st.success("No immediate red flags detected.")
             
-    # FIXED: Safe Report Generation for Download
+    # Report Download
     report_content = f"""
-AUDIT REPORT: {uploaded_file.name}
+AUDIT REPORT: {doc_name}
 ----------------------------------
 TECH SCORE: {s.get('tech', 0)}/100
 REGULATORY SCORE: {s.get('reg', 0)}/100
@@ -182,14 +206,16 @@ if prompt := st.chat_input("Deep dive into specific technical risks..."):
         st.markdown(prompt)
 
     with st.spinner("Analyzing document..."):
-        # A. Semantic Search
+        # Semantic Search
         query_vec = embed_model.encode(prompt).tolist()
         results = index.query(vector=query_vec, top_k=20, include_metadata=True)
+        matches = results.get('matches', []) if results else []
         
-        # B. Rerank Phase
+        # Prepare docs for reranking
         docs_to_rerank = [
             {"id": r['id'], "text": r['metadata']['text'], "metadata": r['metadata']} 
-            for r in results.get('matches', [])
+            for r in matches
+            if 'metadata' in r and 'text' in r['metadata']
         ]
         
         if docs_to_rerank:
@@ -201,18 +227,21 @@ if prompt := st.chat_input("Deep dive into specific technical risks..."):
                 return_documents=True
             )
             
-            # C. Build Context & Citations
+            # Build Context safely using reranker match indices
             context_chunks = []
             citations = []
             for hit in rerank_res.data:
-                txt = hit.document['text'] if isinstance(hit.document, dict) else hit.document.text
-                meta = hit.document['metadata'] if isinstance(hit.document, dict) else hit.document.metadata
+                idx = hit.index
+                matched_doc = docs_to_rerank[idx]
+                txt = matched_doc['text']
+                meta = matched_doc['metadata']
+                
                 context_chunks.append(txt)
                 citations.append(f"Page {int(meta.get('page', 0))} (Match: {hit.score:.2f})")
             
             full_context = "\n\n---\n\n".join(context_chunks)
             
-            # D. Expert Analysis Prompt (Compact Output)
+            # Expert Analysis Prompt
             system_prompt = """
             You are a Senior VC Auditor. Keep your output professional, grounded, and COMPACT.
             DO NOT USE # OR ## HEADERS. 
@@ -234,14 +263,13 @@ if prompt := st.chat_input("Deep dive into specific technical risks..."):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"CONTEXT:\n{full_context}\n\nQUESTION: {prompt}"}
                 ],
-                model="llama-3.1-8b-instant",
                 model="openai/gpt-oss-120b",
                 temperature=0.1
             )
             
             response = chat_completion.choices[0].message.content
             
-            # E. Assistant Display
+            # Display Assistant Output
             with st.chat_message("assistant"):
                 st.markdown(response)
                 with st.expander("📚 View Technical Sources"):
